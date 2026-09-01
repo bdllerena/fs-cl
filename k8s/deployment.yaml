@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rdicidr
+  labels:
+    app: rdicidr
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: rdicidr
+  template:
+    metadata:
+      labels:
+        app: rdicidr
+    spec:
+      containers:
+        - name: rdicidr
+          image: rdicidr:latest
+          imagePullPolicy: IfNotPresent  # FIXME: pods sometimes use stale image — should this be Always?
+          ports:
+            - containerPort: 3000
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "4000m"
+            limits:
+              memory: "8Gi"
+              cpu: "8000m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 1
+            periodSeconds: 3
+            failureThreshold: 1
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 5
