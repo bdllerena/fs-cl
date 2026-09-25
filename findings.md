@@ -3,8 +3,9 @@
 **Date:** 2026-09-25
 **Reviewer:** DevOps engineering
 **Repo:** `bdllerena/fs-cl` (reviewed at `main`, commit `a111a67`)
-**Status:** CI pipeline remediated in PR #1 (branch `fix/ci-pipeline`). Container and
-Kubernetes findings are still open and untouched.
+**Status:** CI pipeline remediated in PR #1 (branch `fix/ci-pipeline`). Container image
+and Kubernetes manifests remediated and validated on Minikube (branch `fix/k8s-minikube`,
+section 11).
 
 > **Remediation log:** section 10 records the four pipeline runs, what each one failed
 > on, and the evidence. Findings carry a status tag: **`[FIXED]`**, **`[OPEN]`**, or
@@ -112,7 +113,7 @@ contains no `package.json`.
 
 **Impact:** `npm ci` exits with `ENOENT`/`Could not read package.json` in all four jobs.
 
-### P0-3 — `npm ci` will abort: `package.json` and `package-lock.json` are out of sync · `[OPEN]`
+### P0-3 — `npm ci` sync claim, corrected · `[FIXED]`
 
 | Item | `package.json` | `package-lock.json` |
 |---|---|---|
@@ -122,10 +123,22 @@ contains no `package.json`.
 The lockfile's root `packages[""]` block lists eight dependencies; `package.json` lists nine.
 `npm ci` refuses to run against a desynchronised lockfile.
 
-**Impact:** `npm ci` fails with *"can only install packages when your package.json and
-package-lock.json are in sync… Missing: prettier@3.3.1 from lock file"*. This breaks the CI
-install job **and** the Docker build ([Dockerfile:4](codebase/rdicidr-0.1.0/Dockerfile#L4)).
-It also tells us `package.json` was edited after the lock was generated.
+**Impact — corrected 2026-09-25 after testing, this was overstated.** The behaviour is
+npm-version dependent, and the original review did not account for that:
+
+| npm | Result |
+|---|---|
+| **7.7.6** (bundled with Node 15.14 — what `node:15-alpine` and the Dockerfile use) | **Succeeds.** Silently resolves `prettier@3.3.1` from the registry and installs it. |
+| **10.x** (Node 20) | **Fails:** `npm error Missing: prettier@3.3.1 from lock file` plus ~40 `Invalid: lock file's …` entries. |
+
+So the claim in PR #1 that "the image cannot be built until P0-3 is fixed" was wrong: at
+the pinned Node 15 the Docker build gets past `npm ci` unharmed. The real blocker was
+**P0-34** below. P0-3 remains a genuine defect — it is a latent trap for any Node
+upgrade, and it is what caused **P0-33** — but it was not blocking the image.
+
+It still tells us `package.json` was edited after the lock was generated.
+
+**Status:** `[FIXED]` — lockfile regenerated on Node 15 (section 11).
 
 ### P0-4 — CI pins Node 14; the project hard-requires Node 15 · `[FIXED]`
 
@@ -262,7 +275,7 @@ mutable — no SHA pinning.
 
 ## 4. Findings — container image
 
-### P0-15 — The image build fails for the same reason CI does · Expected
+### P0-15 — The image build fails for the same reason CI does · `[SUPERSEDED by P0-34]`
 
 [Dockerfile:4](codebase/rdicidr-0.1.0/Dockerfile#L4) runs `npm ci` against the same
 desynchronised lockfile (P0-3). `node:15-alpine` satisfies the engine constraint, so P0-4
@@ -271,7 +284,7 @@ does not apply here, but P0-3 does.
 `node:15-alpine` is also an end-of-life, unmaintained base image (Node 15 reached EOL in
 June 2021) and receives no security patches.
 
-### P0-16 — `REACT_APP_API_URL` can never be set, at build or runtime · Confirmed
+### P0-16 — `REACT_APP_API_URL` can never be set, at build or runtime · `[OPEN]`
 
 CRA substitutes `REACT_APP_*` variables into the bundle at build time. The Dockerfile
 declares no `ARG`/`ENV`, so the baked bundle always contains an empty API URL. Because the
@@ -282,21 +295,21 @@ setting it on the Deployment would have no effect on the served JavaScript.
 either a build argument per environment (image per environment) or a runtime-config pattern
 (e.g. an `env-config.js` written by the container entrypoint and read by the app).
 
-### P1-17 — No `.dockerignore` · Confirmed
+### P1-17 — No `.dockerignore` · `[FIXED]`
 
 `COPY . .` ([Dockerfile:5](codebase/rdicidr-0.1.0/Dockerfile#L5)) runs after `npm ci`. With no
 `.dockerignore`, a local `node_modules`, `build/`, or `.git` is sent in the build context and
 copied over the freshly installed tree — invalidating layer caching and potentially
 overwriting the installed dependencies with whatever the developer had locally.
 
-### P1-18 — Container runs as root · Confirmed
+### P1-18 — Container runs as root · `[FIXED]`
 
 The `nginx:1.21-alpine` stage sets no `USER`. The master process runs as root because it
 binds port 80. Moving to an unprivileged port (e.g. 8080) would allow a non-root user, but
 requires the port change to propagate to `nginx.conf`, the Dockerfile, and the Deployment
 together.
 
-### P2-19 — `node-sass` is declared, unused, and pins the project to Node ≤15 · Confirmed
+### P2-19 — `node-sass` is declared, unused, and pins the project to Node ≤15 · `[FIXED]`
 
 `node-sass@5.0.0` is a direct dependency, but the repository contains **zero** `.scss` or
 `.sass` files — all styling is plain `.css`. `node-sass` is a native module
@@ -307,7 +320,7 @@ only Node ≤15.
 Node LTS, and it is the most likely source of intermittent install failures. Removing it
 should be evaluated before any Node upgrade is attempted.
 
-### P2-20 — Favicon reference points at a file outside `public/` · Confirmed
+### P2-20 — Favicon reference points at a file outside `public/` · `[OPEN]`
 
 `public/index.html` references `%PUBLIC_URL%/RD.svg` (lines 5 and 12), but `RD.svg` exists at
 `src/RD.svg`. `%PUBLIC_URL%` resolves to the `public/` output, so the icon 404s at runtime.
@@ -316,7 +329,7 @@ should be evaluated before any Node upgrade is attempted.
 
 ## 5. Findings — Kubernetes manifests
 
-### P0-21 — The Service selects a label no pod carries · Confirmed
+### P0-21 — The Service selects a label no pod carries · `[FIXED]`
 
 | | Value | Location |
 |---|---|---|
@@ -326,7 +339,7 @@ should be evaluated before any Node upgrade is attempted.
 **Impact:** the Service has zero endpoints permanently. All traffic to `rdicidr-service`
 fails with connection refused. `kubectl get endpoints rdicidr-service` returns `<none>`.
 
-### P0-22 — Probes target a port nothing listens on · Confirmed
+### P0-22 — Probes target a port nothing listens on · `[FIXED]`
 
 Both probes hit port 3000 ([deployment.yaml:33](k8s/deployment.yaml#L33),
 [deployment.yaml:40](k8s/deployment.yaml#L40)), matching `containerPort: 3000`
@@ -338,14 +351,14 @@ server* port and is never used in the built image.
 probe always fails (kubelet restarts the container) → permanent `CrashLoopBackOff`.
 The `/health` endpoint that `nginx.conf` defines is correct — only the port is wrong.
 
-### P0-23 — Liveness probe settings would kill healthy pods · Confirmed
+### P0-23 — Liveness probe settings would kill healthy pods · `[FIXED]`
 
 `initialDelaySeconds: 1`, `periodSeconds: 3`, `failureThreshold: 1`
 ([deployment.yaml:34-36](k8s/deployment.yaml#L34-L36)). A single missed check, one second
 after container start, restarts the pod. There is no tolerance for a transient blip and no
 startup grace.
 
-### P1-24 — Resource requests are ~2 orders of magnitude oversized · Confirmed
+### P1-24 — Resource requests are ~2 orders of magnitude oversized · `[FIXED]`
 
 Requests 4 CPU / 4Gi, limits 8 CPU / 8Gi, at 2 replicas → **8 CPU and 8Gi requested** for a
 static file server. Typical EKS worker nodes (m5.large = 2 vCPU) cannot schedule a single pod.
@@ -355,7 +368,7 @@ needlessly large nodes and cost. An nginx serving a static bundle is realistical
 tens-of-millicores, tens-of-MiB range — but the correct values should come from measurement,
 not from this document's guess.
 
-### P1-25 — Image reference is unresolvable and non-deterministic · Confirmed
+### P1-25 — Image reference is unresolvable and non-deterministic · `[FIXED]`
 
 `image: rdicidr:latest` ([deployment.yaml:19](k8s/deployment.yaml#L19)) has no registry host,
 so a cluster resolves it against Docker Hub, where it does not exist → `ErrImagePull`. For
@@ -366,12 +379,12 @@ node that already holds *any* image called `rdicidr:latest` will never pull a ne
 rollouts are non-deterministic and not reproducible. An immutable tag (git SHA) or a digest
 removes the ambiguity, and makes the pull-policy question moot.
 
-### P1-26 — ClusterIP only; nothing exposes the app externally · Confirmed
+### P1-26 — ClusterIP only; nothing exposes the app externally · `[FIXED]`
 
 The Service is `type: ClusterIP` and there is no Ingress, no `LoadBalancer`, and no
 AWS Load Balancer Controller annotation. The app is unreachable from outside the cluster.
 
-### P2-27 — Manifest completeness gaps · Confirmed
+### P2-27 — Manifest completeness gaps · `[PARTIALLY FIXED]`
 
 No `namespace` on either object (everything lands in `default`); no `securityContext`
 (`runAsNonRoot`, `readOnlyRootFilesystem`, dropped capabilities); no resource `strategy`
@@ -659,25 +672,232 @@ recommendation 27 (move to a supported Node LTS) time-bound rather than cosmetic
 
 ---
 
+## 11. Kubernetes remediation — Minikube (`fix/k8s-minikube`)
+
+Target: Minikube v1.37.0, **docker** driver, **containerd** runtime, single node,
+**arm64** (Apple Silicon), 8 CPU / 7.65Gi allocatable.
+
+The runtime being containerd rather than Docker matters: `eval $(minikube docker-env)`
+does not apply, so the image is side-loaded with `minikube image load`.
+
+### 11.1 Applying the manifests unchanged
+
+Per instruction, the original manifests were applied before anything was altered.
+**They are schema-valid** — `kubectl apply --dry-run=server -f k8s/` passed cleanly, and
+so did the real apply. Every defect is a runtime defect, which is precisely why a review
+that stops at "the YAML parses" would have missed all of them.
+
+| Observed | Finding | Evidence |
+|---|---|---|
+| `ErrImagePull` → `ImagePullBackOff` | P1-25 | `Failed to pull image "rdicidr:latest": ... docker.io/library/rdicidr:latest: pull access denied, repository does not exist` |
+| 1 of 2 replicas stuck `Pending` | P1-24 | `0/1 nodes are available: 1 Insufficient cpu, 1 Insufficient memory` |
+| Service had no endpoints | P0-21 | `kubectl get endpoints rdicidr-service` → `<none>` |
+
+P1-24 quantified: the node offers **8 CPU / 7.65Gi** allocatable; two replicas requested
+**8 CPU / 8Gi**. Even the memory request alone exceeds the node.
+
+P0-21 proven directly rather than inferred:
+
+```
+Service .spec.selector          : {"app":"rdicidr-web"}
+Pod labels                      : {"app":"rdicidr","pod-template-hash":"7d68ff6b5b"}
+pods matching app=rdicidr-web   : 0
+pods actually labelled app=rdicidr: 2
+```
+
+**P0-22 could not be observed**, because no container ever started to fail its probes.
+It was corrected by design, and the corrected form is what the validations below exercise.
+
+### 11.2 P0-34 — `node-sass` cannot build on arm64/musl · `[FIXED]`
+
+**Discovered building the image.** This is P2-19 escalating from "dead weight" to
+"blocks the build outright", and it is the finding that actually prevented an image from
+existing — not P0-3, which the original review named (see the correction there).
+
+`npm ci` publishes no prebuilt `node-sass` binary for linux-musl/arm64, so it falls back
+to `node-gyp`, and `node:15-alpine` ships no Python:
+
+```
+npm ERR! gyp ERR! find Python Python is not set from command line or npm configuration
+npm ERR! gyp ERR! find Python - "python3" is not in PATH or produced an error
+npm ERR! gyp ERR! stack Error: Could not find any Python installation to use
+npm ERR! Build failed with error code: 1
+ERROR: failed to solve: process "/bin/sh -c npm ci" did not complete successfully: exit code: 1
+```
+
+On the CI runner (linux/amd64, glibc) a prebuilt binary exists, which is why the pipeline
+in PR #1 passes and the image build fails. The defect is architecture-specific, and only
+appears on the very platform most developers on this team would build from.
+
+**Fix:** `node-sass` removed from `package.json` (the repository contains **zero** `.scss`
+or `.sass` files, verified). It survives in the lockfile as an *optional peer* of
+`sass-loader`, so the builder additionally uses `npm ci --omit=optional` to skip it
+deterministically rather than relying on optional-dependency failure tolerance.
+
+### 11.3 P1-35 — kubectl context silently reverted to a production EKS cluster · `[OPEN]`
+
+**Operational hazard, worth more attention than its number suggests.**
+
+At session start `kubectl config current-context` was
+`arn:aws:eks:us-east-1:931686776282:cluster/demo-eks` — a real EKS cluster, not Minikube.
+It was switched to `minikube`, and **it reverted on its own partway through the session**.
+Commands issued after that point were answered by EKS: a `kubectl get pods -n production`
+returned "No resources found", which reads exactly like "the workload disappeared".
+
+Nothing was applied to EKS — verified, there is no `production` namespace there — because
+the reversion happened after the applies. That was luck, not design.
+
+**Mitigation used here:** pass `--context=minikube` explicitly on every command rather
+than trusting the ambient context.
+
+**Recommended:** find what rewrites the kubeconfig (an `aws eks update-kubeconfig` in a
+shell profile is the usual culprit) and, separately, put the EKS context behind
+`kubectl config set-context --current --namespace=...` guards or a tool such as `kubectx`
+with a prompt indicator. A cluster this easy to hit by accident will eventually be hit
+by accident.
+
+### 11.4 Changes applied
+
+**Image** (`codebase/rdicidr-0.1.0/`)
+
+| Change | Finding |
+|---|---|
+| `node-sass` removed from `package.json`; lockfile regenerated on Node 15 | P2-19, P0-34, P0-3 |
+| `npm ci --omit=optional` in the builder stage | P0-34 |
+| `.dockerignore` added | P1-17 |
+| nginx listens on **8080**; runs as `nginx` (uid 101); pid relocated to `/tmp` | P1-18 |
+| Tagged `rdicidr:0.1.0`, not `latest` | P1-25 |
+
+Moving nginx off port 80 is what makes the non-root user possible, and it lines up with
+the required Service port, so the same number now runs from container to Service.
+
+**Manifests** (`k8s/`) — `deployment.yaml` and the old `service.yaml` were replaced:
+
+| File | Contents |
+|---|---|
+| `00-namespace.yaml` | Namespace `production` |
+| `10-statefulset.yaml` | StatefulSet `rdicidr`, 3 replicas, `podManagementPolicy: Parallel` |
+| `20-service.yaml` | Headless `rdicidr-headless` (StatefulSet `serviceName`) + `rdicidr-service` on 8080 |
+| `30-ingress.yaml` | Ingress for `fsl-challenge.me` → `rdicidr-service:8080` |
+| `expose-local.sh` | Hosts entry + privileged port bind (the two steps needing root) |
+
+Files are numbered because `kubectl apply -f k8s/` processes a directory in **alphabetical
+order**; unprefixed, `30-ingress.yaml` would sort before `00-namespace.yaml` and fail with
+`namespaces "production" not found`.
+
+Other manifest corrections: selector labels now match the pod template exactly (P0-21);
+probes address the port **by name** so a port change cannot desynchronise them again
+(P0-22); liveness `failureThreshold` 3 with a 5s initial delay (P0-23); requests cut from
+4 CPU/4Gi to 10m/32Mi with 200m/128Mi limits (P1-24); `app.kubernetes.io/*` labels,
+`securityContext` with `runAsNonRoot`, `readOnlyRootFilesystem`, `drop: ["ALL"]` and
+`seccompProfile: RuntimeDefault` (P2-27).
+
+`readOnlyRootFilesystem: true` requires the two paths nginx writes to be mounted
+`emptyDir`: `/tmp` (the relocated pid file) and `/var/cache/nginx` (client/proxy temp).
+
+> **One concern with the specification, stated once and then built as asked.** A StatefulSet
+> is the wrong workload type for this application: it serves identical read-only static
+> files, holds no per-replica state, claims no volumes, and needs no stable identity or
+> ordered startup. A Deployment expresses that and rolls out faster. The requirement asks
+> for a StatefulSet, so that is what is built — `podManagementPolicy: Parallel` removes the
+> ordered-startup penalty, which is the only part that would otherwise cost anything here.
+
+### 11.5 Validations
+
+```
+$ kubectl --context=minikube get pods -n production
+NAME        READY   STATUS    RESTARTS   AGE
+rdicidr-0   1/1     Running   0          3m8s
+rdicidr-1   1/1     Running   0          3m8s
+rdicidr-2   1/1     Running   0          3m8s
+
+$ kubectl --context=minikube get statefulset,svc,ingress -n production
+statefulset.apps/rdicidr    3/3
+service/rdicidr-headless    ClusterIP   None             8080/TCP
+service/rdicidr-service     ClusterIP   10.111.144.146   8080/TCP
+ingress/rdicidr             nginx       fsl-challenge.me   192.168.49.2   80
+
+$ kubectl --context=minikube get endpointslices -n production
+rdicidr-headless-cdl27   IPv4   8080   10.244.0.7,10.244.0.9,10.244.0.8
+rdicidr-service-95z29    IPv4   8080   10.244.0.7,10.244.0.9,10.244.0.8
+```
+
+| Requirement | Result |
+|---|---|
+| StatefulSet, ≥3 replicas | ✅ `statefulset.apps/rdicidr` 3/3 |
+| Service + StatefulSet in `production` | ✅ all objects namespaced |
+| Service listens on 8080 | ✅ both Services `8080/TCP`, targetPort `http` (8080) |
+| Pods Running, probes passing consistently | ✅ 3/3 Ready, **0 restarts**, **0 `Unhealthy` events** |
+| Reachable at `http://fsl-challenge.me` | ✅ through the Ingress (see below) |
+
+Endpoint counts are the direct refutation of P0-21: both Services resolve to all three
+Pod IPs, where the original resolved to none.
+
+HTTP behaviour through the Ingress, with `Host: fsl-challenge.me`:
+
+```
+/health            -> ok
+/                  -> HTTP 200   <title>RDerik Interactive CIDR</title>
+/some/deep/route   -> HTTP 200   (SPA fallback works)
+Host: not-the-app  -> HTTP 404   (host routing is actually enforced, not a catch-all)
+```
+
+Image checks before deployment: serves `/health` → `ok`, runs as
+`uid=101(nginx) gid=101(nginx)`, `linux/arm64`, 22.5MB.
+
+### 11.6 The last mile needs root
+
+Two steps cannot be automated from this session because both require `sudo` and no
+passwordless sudo is configured:
+
+1. `127.0.0.1  fsl-challenge.me` in `/etc/hosts`
+2. binding **port 80** on localhost (ports below 1024 are privileged on macOS)
+
+`k8s/expose-local.sh` performs both, idempotently. Everything on the cluster side is
+verified working — the chain was validated end to end through an unprivileged port
+(`kubectl port-forward … 18080:80`) with the `Host` header set, which exercises the exact
+same Ingress rule, Service and Pods that port 80 will.
+
+### 11.7 Still open
+
+- **P0-16** — `REACT_APP_API_URL` is still inlined at build time, so the running Pods
+  render an empty API URL. Unchanged: it needs a build-arg-per-environment or a runtime
+  `env-config.js`, which is a packaging decision (recommendation 15).
+- **P1-35** — the kubeconfig context reversion above.
+- **P2-20** — the `RD.svg` favicon 404.
+- **P1-13** — no image is built or pushed by CI; `rdicidr:0.1.0` was built and side-loaded
+  by hand. Nothing yet connects a green pipeline to a deployed Pod.
+- **P2-27 partially** — no HPA, PodDisruptionBudget, NetworkPolicy or per-environment
+  overlay. None are required for a single-node local cluster; all matter on EKS.
+
+---
+
 ## Summary
 
-**CI — resolved.** The pipeline had never executed: its workflow file sat inside the
-application subdirectory rather than at the repository root. Behind that single blocker
-were eight more independent failures. Four runs took it from never-triggered to green,
-and the sequence is worth keeping: each run exposed exactly one defect, and one of them
-(**P0-33**, a cache key hashed after `npm install` had rewritten the lockfile) was not
-predictable from static review at all. The two application defects it surfaced — an
-ESLint config referencing a plugin that was never installed, and a test asserting on an
-environment variable defined nowhere in the repository — had been invisible for the
-entire life of the repository because nothing ever ran them.
+**CI — resolved.** The pipeline had never executed: its workflow sat inside the
+application subdirectory rather than at the repository root. Four runs took it from
+never-triggered to green, each exposing exactly one defect, one of which (**P0-33**) was
+not predictable from static review at all.
 
-**Container and Kubernetes — still open.** The image cannot be built at all while P0-3
-stands, since the Dockerfile uses `npm ci` against a desynchronised lockfile. The
-manifests cannot serve traffic: the Service selects a label no pod carries, and both
-probes target a port nothing listens on, guaranteeing `CrashLoopBackOff` behind a Service
-with no endpoints.
+**Container and Kubernetes — resolved and validated on Minikube.** Applying the original
+manifests unchanged proved three findings in minutes: `ErrImagePull` on an image with no
+registry, a replica unschedulable against a 4 CPU / 4Gi request, and a Service with zero
+endpoints because it selected a label no pod carried. Notably the manifests were
+**schema-valid throughout** — a review that stopped at "the YAML parses" would have caught
+none of it.
 
-**The delivery gap is unchanged and remains the largest piece of work.** Between a green
-build and a running container there is still nothing — no artifact, no image build, no
-registry, no AWS authentication, no deploy. CI now proves the application compiles and
-its tests pass. It proves nothing about what ships.
+Building the image surfaced **P0-34**, the finding that actually blocked it: `node-sass`
+has no prebuilt binary for arm64/musl and `node:15-alpine` has no Python. It is
+architecture-specific, invisible on the amd64 CI runner, and it hits precisely the
+platform most of this team develops on — for a dependency the application never imports.
+
+**Two corrections to the original review.** P0-3's impact was overstated: npm 7.7.6, the
+version Node 15 bundles and the Dockerfile uses, installs happily past the desynchronised
+lockfile; only npm 8+ aborts. And P0-15 named the wrong blocker for the image build.
+Both are recorded in place rather than quietly amended.
+
+**The delivery gap is unchanged and remains the largest piece of work.** The image running
+on Minikube was built and side-loaded by hand. CI still stops at `npm run build` — no
+artifact, no image, no registry, no AWS authentication, no deploy. Three replicas serving
+correctly in `production` on a laptop is not the same as a path from commit to cluster,
+and that path does not exist yet.

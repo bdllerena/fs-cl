@@ -1,0 +1,26 @@
+# Exposes the app at http://fsl-challenge.me. Requires the Minikube ingress addon
+# (`minikube addons enable ingress`) and a hosts entry pointing the name at
+# 127.0.0.1, with `minikube tunnel` binding port 80 on the host.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rdicidr
+  namespace: production
+  labels:
+    app.kubernetes.io/name: rdicidr
+    app.kubernetes.io/instance: rdicidr
+    app.kubernetes.io/component: web
+    app.kubernetes.io/part-of: rdicidr
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: fsl-challenge.me
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: rdicidr-service
+                port:
+                  number: 8080
