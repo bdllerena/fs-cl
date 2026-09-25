@@ -3,9 +3,9 @@
 **Date:** 2026-09-25
 **Reviewer:** DevOps engineering
 **Repo:** `bdllerena/fs-cl` (reviewed at `main`, commit `a111a67`)
-**Status:** CI pipeline remediated in PR #1 (branch `fix/ci-pipeline`). Container image
-and Kubernetes manifests remediated and validated on Minikube (branch `fix/k8s-minikube`,
-section 11).
+**Status:** CI pipeline remediated (section 10). Image and manifests remediated and
+validated on Minikube (section 11). AWS delivery built and validated — the app is live on
+the public internet behind an ALB (section 12); the deploy stage runs on merge to `main`.
 
 > **Remediation log:** section 10 records the four pipeline runs, what each one failed
 > on, and the evidence. Findings carry a status tag: **`[FIXED]`**, **`[OPEN]`**, or
@@ -251,7 +251,7 @@ decision on which convention is canonical.
 - No `concurrency:` group — rapid pushes to the same branch run redundant, overlapping jobs.
 - No `timeout-minutes` — a hung job occupies a runner for the 6-hour default.
 
-### P1-13 — Pipeline stops at `npm run build`; no artifact, image, or deploy · `[OPEN]`
+### P1-13 — Pipeline stops at `npm run build`; no artifact, image, or deploy · `[FIXED]`
 
 The repository ships a `Dockerfile` and Kubernetes manifests, and neither is referenced by CI.
 Missing stages:
@@ -284,7 +284,7 @@ does not apply here, but P0-3 does.
 `node:15-alpine` is also an end-of-life, unmaintained base image (Node 15 reached EOL in
 June 2021) and receives no security patches.
 
-### P0-16 — `REACT_APP_API_URL` can never be set, at build or runtime · `[OPEN]`
+### P0-16 — `REACT_APP_API_URL` can never be set, at build or runtime · `[OPEN — now visible in production]`
 
 CRA substitutes `REACT_APP_*` variables into the bundle at build time. The Dockerfile
 declares no `ARG`/`ENV`, so the baked bundle always contains an empty API URL. Because the
@@ -889,32 +889,274 @@ foreground). To undo: Ctrl-C, then
 
 ---
 
+## 12. AWS delivery — ECR, EKS and an internet-facing ALB (`fix/aws-cicd`)
+
+Closes the delivery gap that sections 10 and 11 both ended on: there is now a path from
+a commit on `main` to a running Pod behind a public load balancer.
+
+### 12.1 What was already there
+
+| Resource | State |
+|---|---|
+| EKS `demo-eks` | ACTIVE, v1.36, VPC `vpc-0ccddba1a82f9f3d4` |
+| Node group `demo-node` | 1 node, **t4g.medium — arm64**, 1930m allocatable CPU |
+| Subnets | 2 private (`internal-elb` tag, NAT) — the cluster's own; 2 public (`kubernetes.io/role/elb=1`, IGW) |
+| IAM role `github-actions-eks` | Trusts GitHub OIDC for `repo:bdllerena/fs-cl*`; EKS access entry with `AmazonEKSClusterAdminPolicy` |
+| GitHub OIDC provider | Registered |
+| Cluster IAM OIDC provider | **Absent** — required for IRSA |
+| ECR | **No repositories** |
+| Load balancer controller | **Not installed**, no `IngressClass` |
+| EKS managed addons | None |
+
+The VPC was already laid out correctly for a public ALB — both public subnets carry
+`kubernetes.io/role/elb=1` and route to `igw-0e883a49f80299d71`. Nothing about the
+networking needed changing.
+
+### 12.2 P0-36 — the CI role's policy pointed at a cluster that does not exist · `[FIXED]`
+
+`github-actions-demo-eks` granted `eks:DescribeCluster` on:
+
+```
+arn:aws:eks:us-east-1:931686776282:cluster/eks-demo     <- the policy
+arn:aws:eks:us-east-1:931686776282:cluster/demo-eks     <- the actual cluster
+```
+
+The name is reversed, so the statement matched nothing and the role could not describe
+the cluster it exists to deploy to — `aws eks update-kubeconfig` would have failed on the
+very first deploy. The policy also carried **no ECR permissions at all**, so the role
+could not have pushed an image either.
+
+Nothing had ever caught this because nothing had ever assumed the role: the pipeline that
+would have used it had never run (P0-1).
+
+**Fix:** policy v2 corrects the ARN, adds account-wide `ecr:GetAuthorizationToken` (that
+call does not accept a resource restriction) and adds push/pull scoped to the single
+`rdicidr` repository.
+
+### 12.3 P0-37 — controller IAM policy and controller version were three majors apart · `[FIXED]`
+
+The IAM policy published in the controller's own repository is **version-specific**, and
+the installation instructions most people copy pin a tag by hand while Helm installs
+whatever is current. That is exactly what happened here:
+
+```
+IAM policy taken from   v2.8.1
+Helm chart installed    v3.5.0
+```
+
+The ALB was created, then reconciliation failed repeatedly:
+
+```
+Failed deploy model ... CreateLoadBalancer ... AccessDenied:
+  not authorized to perform: ec2:GetSecurityGroupsForVpc
+Failed deploy model ... DescribeListenerAttributes ... AccessDenied:
+  not authorized to perform: elasticloadbalancing:DescribeListenerAttributes
+```
+
+Nine actions were added between the two versions:
+
+```
+ec2:DescribeIpamPools                        elasticloadbalancing:DescribeCapacityReservation
+ec2:DescribeRouteTables                      elasticloadbalancing:ModifyCapacityReservation
+ec2:GetSecurityGroupsForVpc                  elasticloadbalancing:ModifyIpPools
+elasticloadbalancing:DescribeListenerAttributes
+elasticloadbalancing:ModifyListenerAttributes
+elasticloadbalancing:SetRulePriorities
+```
+
+**Fix:** policy replaced with the `v3.5.0` document (5196 chars, within IAM's 6144 limit).
+
+**The lesson is the reusable part:** pin the Helm chart version *and* source the IAM
+policy from the matching tag, in one place. An unpinned `helm upgrade` can silently move
+the controller ahead of its own permissions, and the failure surfaces as an opaque
+`AccessDenied` on an API nobody deliberately chose to call.
+
+### 12.4 P1-38 — the node group is arm64 · `[FIXED]`
+
+`t4g.medium` is Graviton. An image built on the default `ubuntu-latest` runner is amd64
+and would fail on these nodes with `exec format error`. The `image` job therefore runs on
+**`ubuntu-24.04-arm`** — native, no QEMU, and free because this repository is public.
+
+This is the same architecture question that produced P0-34 locally, arriving from the
+other direction. It is worth stating plainly: **this application's platform is arm64
+end to end** — the developer laptops, the Minikube node, and the EKS node group.
+
+### 12.5 P1-39 — the Ingress status lagged the real ALB · `[OBSERVED]`
+
+After the policy fix the ALB reached `active` in AWS, but
+`ingress.status.loadBalancer` stayed empty and `kubectl get ingress` showed no ADDRESS for
+several minutes. The controller had backed off after the repeated 403s and did not
+re-reconcile on its own within a useful window. A `rollout restart` of the controller
+populated the status immediately.
+
+Consequence for the pipeline: a deploy job that waits on the Ingress address can outlast
+a perfectly healthy load balancer. The `Resolve the load balancer address` step polls for
+10 minutes and then prints `kubectl describe ingress` rather than failing silently, so the
+underlying AWS error is in the log instead of a bare timeout.
+
+### 12.6 What was installed
+
+```bash
+aws ecr create-repository --repository-name rdicidr \
+  --image-scanning-configuration scanOnPush=true --image-tag-mutability IMMUTABLE
+
+eksctl utils associate-iam-oidc-provider --cluster demo-eks --approve
+
+aws iam create-policy --policy-name AWSLoadBalancerControllerIAMPolicy \
+  --policy-document file://iam_policy.json      # from the v3.5.0 tag -- see P0-37
+
+eksctl create iamserviceaccount --cluster demo-eks \
+  --namespace kube-system --name aws-load-balancer-controller \
+  --role-name AmazonEKSLoadBalancerControllerRole \
+  --attach-policy-arn arn:aws:iam::931686776282:policy/AWSLoadBalancerControllerIAMPolicy --approve
+
+helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  -n kube-system --set clusterName=demo-eks \
+  --set serviceAccount.create=false --set serviceAccount.name=aws-load-balancer-controller \
+  --set region=us-east-1 --set vpcId=vpc-0ccddba1a82f9f3d4 \
+  --set replicaCount=1
+```
+
+`replicaCount=1` because the cluster has a single node; the chart's default of 2 leaves
+one replica `Pending` forever on its anti-affinity rule.
+
+ECR is **tag-immutable** and scans on push, so a tag always denotes one image and cannot be
+quietly overwritten.
+
+### 12.7 Pipeline
+
+```
+install -> lint -> test -> build -> image -> deploy
+                                    \________________/
+                                    only on push to main
+```
+
+`image` and `deploy` are both gated on `github.event_name == 'push' && github.ref ==
+'refs/heads/main'`, so **a pull request cannot push an image or touch the cluster** — it
+runs the four CI stages and stops. Authentication is GitHub OIDC into
+`github-actions-eks`; `id-token: write` is granted per-job, not workflow-wide, and there
+are no long-lived AWS keys anywhere.
+
+Images are tagged with the commit SHA. Because ECR is tag-immutable, re-running a
+workflow for an already-published commit would fail on `PutImage`, so the job checks
+`aws ecr describe-images` first and skips the build when the SHA is already there.
+
+The deploy job pins the image, applies, waits for the rollout, resolves the ALB hostname,
+and **smoke-tests `/health` through the load balancer before it reports success** — a
+green deploy means traffic actually flowed, not merely that `kubectl apply` returned 0.
+
+### 12.8 Manifest layout
+
+Two targets now front the app differently, which is what finally justifies overlays
+(P2-27 called for exactly this):
+
+```
+k8s/base/                 namespace, statefulset, services
+k8s/overlays/minikube/    nginx Ingress, image side-loaded as rdicidr:0.1.0
+k8s/overlays/aws/         ALB Ingress, image from ECR pinned to the commit SHA
+```
+
+`kubectl apply -k k8s/overlays/<target>`. Kustomize is built into kubectl, so this adds no
+tooling. It also retires the numeric filename prefixes from section 11 — kustomize orders
+by the `resources` list, not by filename.
+
+The ALB Ingress names its two public subnets explicitly rather than relying only on tag
+discovery, so a tag edit elsewhere in the VPC cannot silently relocate the load balancer.
+
+### 12.9 Validation
+
+```
+$ kubectl get pods -n production -o wide
+rdicidr-0   1/1  Running  0  10.0.11.36
+rdicidr-1   1/1  Running  0  10.0.11.179
+rdicidr-2   1/1  Running  0  10.0.11.90
+
+$ kubectl get ingress -n production
+rdicidr   alb   *   k8s-producti-rdicidr-698491d6e6-2111000178.us-east-1.elb.amazonaws.com   80
+
+$ aws elbv2 describe-load-balancers
+k8s-producti-rdicidr-698491d6e6   active   internet-facing   application
+  us-east-1a  subnet-0f206e07b5fe21f93      <- public
+  us-east-1b  subnet-08194d1f169814522      <- public
+
+$ aws elbv2 describe-target-health
+10.0.11.36   8080  healthy
+10.0.11.90   8080  healthy
+10.0.11.179  8080  healthy
+```
+
+From the public internet:
+
+```
+http://k8s-producti-rdicidr-698491d6e6-2111000178.us-east-1.elb.amazonaws.com
+  /health       -> 200  "ok"
+  /             -> 200  <title>RDerik Interactive CIDR</title>
+  /deep/route   -> 200  (SPA fallback)
+```
+
+All three Pod IPs register as ALB targets on 8080 — the `target-type: ip` path, no
+NodePort hop.
+
+**How this run was performed.** The AWS resources above were created once by hand, and the
+first deployment was executed with the same commands the `deploy` job runs, against the
+image the `image` job would build. That proves the path end to end and de-risks the first
+pipeline run. **The pipeline itself has not yet executed the deploy**, because `image` and
+`deploy` are gated on `main` and the work is still on a branch. Merging is what hands the
+deployment over to CI.
+
+### 12.10 Open
+
+- **P0-16** — still unresolved and now visible in production: the served page renders
+  `API:` with no value, because `REACT_APP_API_URL` is inlined at build time and nothing
+  sets it. The image would need rebuilding per environment, or a runtime `env-config.js`.
+- **Namespace mismatch** — the `github-actions-eks` access entry carries
+  `AmazonEKSEditPolicy` scoped to namespace **`application`**, while the app deploys to
+  **`production`**. It works only because `AmazonEKSClusterAdminPolicy` is also attached.
+  Someone intended `application`; that should be reconciled, and cluster-admin dropped in
+  favour of the namespace-scoped grant.
+- **HTTP only** — the listener is port 80. HTTPS needs an ACM certificate, a real domain,
+  and `ssl-redirect`. The app is served over plaintext to the internet today.
+- **No `WAF`, no access logs, no deletion protection** on the ALB.
+- **Single node, single AZ for Pods** — all three replicas sit on one node, so the
+  StatefulSet's 3 replicas buy no availability. The ALB spans two AZs; the workload does
+  not.
+- **No EKS managed addons** — no EBS CSI, no VPC CNI/kube-proxy/CoreDNS as managed addons,
+  so they will not receive EKS-driven upgrades.
+- **Cost** — an idle ALB is roughly $16–18/month plus LCU charges, and ECR storage accrues
+  per image. Both persist until deleted.
+
+---
+
 ## Summary
 
 **CI — resolved.** The pipeline had never executed: its workflow sat inside the
 application subdirectory rather than at the repository root. Four runs took it from
-never-triggered to green, each exposing exactly one defect, one of which (**P0-33**) was
-not predictable from static review at all.
+never-triggered to green, each exposing exactly one defect.
 
-**Container and Kubernetes — resolved and validated on Minikube.** Applying the original
-manifests unchanged proved three findings in minutes: `ErrImagePull` on an image with no
-registry, a replica unschedulable against a 4 CPU / 4Gi request, and a Service with zero
-endpoints because it selected a label no pod carried. Notably the manifests were
-**schema-valid throughout** — a review that stopped at "the YAML parses" would have caught
-none of it.
+**Container and Kubernetes — resolved and validated.** Applying the original manifests
+unchanged proved three findings in minutes, all of them runtime defects behind
+**schema-valid YAML**: an image with no registry, a replica unschedulable against a
+4 CPU / 4Gi request, and a Service selecting a label no pod carried.
 
-Building the image surfaced **P0-34**, the finding that actually blocked it: `node-sass`
-has no prebuilt binary for arm64/musl and `node:15-alpine` has no Python. It is
-architecture-specific, invisible on the amd64 CI runner, and it hits precisely the
-platform most of this team develops on — for a dependency the application never imports.
+**AWS delivery — built and live.** ECR, IRSA, the load balancer controller and an
+internet-facing ALB now stand behind `install → lint → test → build → image → deploy`,
+with OIDC authentication and no long-lived keys. Three Pods serve the public internet and
+register healthy as ALB targets.
 
-**Two corrections to the original review.** P0-3's impact was overstated: npm 7.7.6, the
-version Node 15 bundles and the Dockerfile uses, installs happily past the desynchronised
-lockfile; only npm 8+ aborts. And P0-15 named the wrong blocker for the image build.
-Both are recorded in place rather than quietly amended.
+**The recurring theme is that nothing had ever run.** Every serious defect in this
+repository — the ESLint plugin that was never installed, the test asserting on an undefined
+variable, the Service selector typo, the IAM policy naming `eks-demo` instead of
+`demo-eks` — was the kind that a single execution exposes immediately and that no amount of
+reading finds reliably. The pipeline's absence was not one defect among many; it was the
+reason the others survived.
 
-**The delivery gap is unchanged and remains the largest piece of work.** The image running
-on Minikube was built and side-loaded by hand. CI still stops at `npm run build` — no
-artifact, no image, no registry, no AWS authentication, no deploy. Three replicas serving
-correctly in `production` on a laptop is not the same as a path from commit to cluster,
-and that path does not exist yet.
+**Architecture is the second theme.** arm64 turned up three times from three directions:
+`node-sass` unable to build on musl/arm64 (P0-34), the EKS node group being Graviton
+(P1-38), and the controller image needing a multi-arch tag. The platform is arm64 end to
+end, and every build decision has to say so explicitly.
+
+**What is still not done.** `REACT_APP_API_URL` remains inlined at build time, so the live
+site renders an empty API URL — the one original finding that survived every pass, because
+it is a packaging decision rather than a bug. The ALB serves plaintext HTTP. All three
+replicas sit on a single node, so the replica count buys no availability. And the deploy
+stage, though built and proven by hand, has not yet been driven by the pipeline itself.
