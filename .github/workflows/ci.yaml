@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
-      # Defect fixed (findings P1-31, found by run 36176886901): the cache key is
+      # Defect fixed (findings P0-33, found by run 36176886901): the cache key is
       # computed once here, from the pristine checked-out lockfile, and reused by
       # every downstream job. Previously each job called hashFiles() itself, and the
       # save step evaluated it AFTER `npm install` had rewritten package-lock.json,
