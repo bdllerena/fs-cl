@@ -1,0 +1,48 @@
+# Headless Service backing the StatefulSet's `serviceName`. It gives each replica
+# a stable DNS name; it is not the entry point for traffic.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rdicidr-headless
+  namespace: production
+  labels:
+    app.kubernetes.io/name: rdicidr
+    app.kubernetes.io/instance: rdicidr
+    app.kubernetes.io/component: web
+    app.kubernetes.io/part-of: rdicidr
+spec:
+  clusterIP: None
+  # These labels must match the StatefulSet's pod template exactly. The previous
+  # Service selected `app: rdicidr-web` while the pods were labelled
+  # `app: rdicidr`, so it had zero endpoints permanently.
+  selector:
+    app.kubernetes.io/name: rdicidr
+    app.kubernetes.io/instance: rdicidr
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: http
+---
+# The Service traffic actually goes through, on port 8080.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rdicidr-service
+  namespace: production
+  labels:
+    app.kubernetes.io/name: rdicidr
+    app.kubernetes.io/instance: rdicidr
+    app.kubernetes.io/component: web
+    app.kubernetes.io/part-of: rdicidr
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: rdicidr
+    app.kubernetes.io/instance: rdicidr
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      # Named target port, resolved from the container's `http` port.
+      targetPort: http

@@ -1,0 +1,10 @@
+# Keeps the build context small and stops a developer's local tree from being
+# copied over the dependencies installed by `npm ci` in the builder stage.
+node_modules
+build
+.git
+.github
+.DS_Store
+*.log
+npm-debug.log*
+.env*

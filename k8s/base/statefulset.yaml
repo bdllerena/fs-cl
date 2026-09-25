@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rdicidr
+  namespace: production
+  labels: &labels
+    app.kubernetes.io/name: rdicidr
+    app.kubernetes.io/instance: rdicidr
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/component: web
+    app.kubernetes.io/part-of: rdicidr
+spec:
+  # Governing headless Service. A StatefulSet requires one for stable per-Pod DNS
+  # (rdicidr-0.rdicidr-headless.production.svc.cluster.local).
+  serviceName: rdicidr-headless
+  replicas: 3
+  # The replicas are interchangeable stateless web servers, so there is no reason
+  # to start them one at a time and wait for each to become Ready.
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rdicidr
+      app.kubernetes.io/instance: rdicidr
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      securityContext:
+        # uid/gid 101 is the `nginx` user the base image already creates, and the
+        # image serves on 8080 so no privileged port bind is needed.
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rdicidr
+          image: rdicidr:0.1.0
+          # Immutable tag rather than `latest`. The image is side-loaded into the
+          # Minikube containerd namespace via `minikube image load`, so there is no
+          # registry to pull from and IfNotPresent resolves it locally.
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          # Sized for a static file server. The previous manifest requested
+          # 4 CPU / 4Gi per replica, which the node could not schedule.
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "32Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          # Probes address the port by name, so a port change cannot desynchronise
+          # them the way a hardcoded 3000 did.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            # Three consecutive misses, not one, so a single transient blip does
+            # not restart a healthy container.
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # The root filesystem is read-only, so the two paths nginx writes to are
+          # backed by emptyDir: the pid file (relocated to /tmp in the image) and
+          # the client/proxy temp directories.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: nginx-cache
+          emptyDir: {}

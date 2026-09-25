@@ -1,0 +1,42 @@
+# Internet-facing Application Load Balancer, provisioned by the AWS Load Balancer
+# Controller from this Ingress.
+#
+# No `host:` rule: the app is reached at the ALB's own DNS name, so any Host
+# matches. Add a host rule once a real domain and certificate exist.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rdicidr
+  namespace: production
+  labels:
+    app.kubernetes.io/name: rdicidr
+    app.kubernetes.io/instance: rdicidr
+    app.kubernetes.io/component: web
+    app.kubernetes.io/part-of: rdicidr
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    # `ip` targets the Pod IPs directly. With the VPC CNI the Pods hold real VPC
+    # addresses, so the ALB reaches them without a NodePort hop.
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    # Subnets are discovered from the kubernetes.io/role/elb=1 tag on the two
+    # public subnets; named explicitly so a tag change cannot silently move the
+    # load balancer somewhere unintended.
+    alb.ingress.kubernetes.io/subnets: subnet-0f206e07b5fe21f93,subnet-08194d1f169814522
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/healthcheck-port: traffic-port
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/tags: app.kubernetes.io/part-of=rdicidr,managed-by=aws-load-balancer-controller
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: rdicidr-service
+                port:
+                  number: 8080

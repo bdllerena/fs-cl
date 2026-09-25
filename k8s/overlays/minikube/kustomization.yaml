@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Local target. Apply with:  kubectl apply -k k8s/overlays/minikube
+# The image is side-loaded with `minikube image load rdicidr:0.1.0`, so the base
+# image name and tag are used unchanged.
+resources:
+  - ../../base
+  - ingress-nginx.yaml
