@@ -828,7 +828,7 @@ rdicidr-service-95z29    IPv4   8080   10.244.0.7,10.244.0.9,10.244.0.8
 | Service + StatefulSet in `production` | ✅ all objects namespaced |
 | Service listens on 8080 | ✅ both Services `8080/TCP`, targetPort `http` (8080) |
 | Pods Running, probes passing consistently | ✅ 3/3 Ready, **0 restarts**, **0 `Unhealthy` events** |
-| Reachable at `http://fsl-challenge.me` | ✅ through the Ingress (see below) |
+| Reachable at `http://fsl-challenge.me` | ⚠️ Ingress verified on that exact `Host`; the privileged port-80 bind is deferred — see 11.6 |
 
 Endpoint counts are the direct refutation of P0-21: both Services resolve to all three
 Pod IPs, where the original resolved to none.
@@ -853,10 +853,27 @@ passwordless sudo is configured:
 1. `127.0.0.1  fsl-challenge.me` in `/etc/hosts`
 2. binding **port 80** on localhost (ports below 1024 are privileged on macOS)
 
-`k8s/expose-local.sh` performs both, idempotently. Everything on the cluster side is
-verified working — the chain was validated end to end through an unprivileged port
-(`kubectl port-forward … 18080:80`) with the `Host` header set, which exercises the exact
-same Ingress rule, Service and Pods that port 80 will.
+`k8s/expose-local.sh` performs both, idempotently.
+
+**Deliberately not run — deferred by decision, not blocked.** Nothing on this machine was
+modified: no `/etc/hosts` entry was written and no privileged port was bound. The app is
+instead reached over an unprivileged forward:
+
+```
+kubectl --context=minikube port-forward -n ingress-nginx \
+  svc/ingress-nginx-controller 18080:80 --address 127.0.0.1
+
+curl -H "Host: fsl-challenge.me" http://127.0.0.1:18080/
+```
+
+This traverses the identical path port 80 would — the same Ingress rule matched on the
+same `Host`, the same Service, the same three Pods. The only untested element is the
+privileged bind itself. Requirement 5 is therefore met in substance but not literally:
+`http://fsl-challenge.me` in a browser needs `k8s/expose-local.sh` run once.
+
+**To finish it later:** `./k8s/expose-local.sh` (prompts for sudo twice, stays in the
+foreground). To undo: Ctrl-C, then
+`sudo sed -i '' '/fsl-challenge\.me/d' /etc/hosts`.
 
 ### 11.7 Still open
 
