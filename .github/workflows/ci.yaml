@@ -1,7 +1,9 @@
 name: CI
 
 # Runs on every pull request against any branch, and on pushes to main so the
-# post-merge state is verified too.
+# post-merge state is verified too. Pull requests run the four CI stages only;
+# the image and deploy stages are gated on main (see their `if:` conditions), so
+# a pull request can never push an image or touch the cluster.
 # Defect fixed (findings P1-11): the previous `feature-*` push filter never matched
 # `feature/*` branches, because `*` does not cross `/` in GitHub branch globs.
 on:
@@ -158,3 +160,156 @@ jobs:
 
       - name: Build production bundle
         run: npm run build
+
+  # ---------------------------------------------------------------------------
+  # Continuous delivery. Both jobs are gated on a push to main, so they never run
+  # for a pull request.
+  # ---------------------------------------------------------------------------
+
+  image:
+    name: Build and push image
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Native arm64 runner: the EKS node group is t4g.medium (Graviton). Building
+    # on an amd64 runner would produce an image the nodes cannot execute, and
+    # cross-building under QEMU is several times slower. Free for public repos.
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      # Required to request the OIDC token that is exchanged for the AWS role.
+      # No long-lived AWS access keys exist anywhere in this workflow.
+      id-token: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    defaults:
+      run:
+        # Overrides the workflow-level default: these steps work from the
+        # repository root, not the application directory.
+        working-directory: .
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::931686776282:role/github-actions-eks
+          aws-region: us-east-1
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve image reference
+        id: meta
+        run: |
+          echo "image=${{ steps.ecr.outputs.registry }}/rdicidr:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Skip build if this commit is already in ECR
+        id: exists
+        run: |
+          # The repository is tag-immutable, so re-running this workflow for a
+          # commit that was already pushed would otherwise fail on PutImage.
+          if aws ecr describe-images --repository-name rdicidr \
+               --image-ids "imageTag=${GITHUB_SHA}" --region us-east-1 >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Image for ${GITHUB_SHA} already present; skipping build."
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push
+        if: steps.exists.outputs.found == 'false'
+        run: |
+          docker build -t "${{ steps.meta.outputs.image }}" codebase/rdicidr-0.1.0
+          docker push "${{ steps.meta.outputs.image }}"
+
+  deploy:
+    name: Deploy to EKS
+    needs: image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    # One deploy at a time; never cancel a half-applied rollout.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    environment:
+      name: production
+      url: ${{ steps.alb.outputs.url }}
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::931686776282:role/github-actions-eks
+          aws-region: us-east-1
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name demo-eks --region us-east-1
+
+      - name: Pin the image to this commit
+        run: |
+          sed -i "s|IMAGE_TAG_PLACEHOLDER|${GITHUB_SHA}|" k8s/overlays/aws/kustomization.yaml
+          kubectl kustomize k8s/overlays/aws | grep -E "^\s+image:"
+
+      - name: Apply manifests
+        run: kubectl apply -k k8s/overlays/aws
+
+      - name: Wait for rollout
+        run: kubectl rollout status statefulset/rdicidr -n production --timeout=5m
+
+      - name: Resolve the load balancer address
+        id: alb
+        run: |
+          # The controller provisions the ALB asynchronously; the Ingress gets its
+          # hostname once the load balancer is active.
+          for i in $(seq 1 60); do
+            host=$(kubectl get ingress rdicidr -n production \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            [ -n "$host" ] && break
+            sleep 10
+          done
+          if [ -z "$host" ]; then
+            echo "::error::Ingress did not receive a load balancer hostname in 10 minutes"
+            kubectl describe ingress rdicidr -n production
+            exit 1
+          fi
+          echo "url=http://${host}" >> "$GITHUB_OUTPUT"
+          echo "Application URL: http://${host}"
+
+      - name: Smoke-test through the load balancer
+        run: |
+          url="${{ steps.alb.outputs.url }}"
+          # A new ALB takes a little while to start passing traffic even after it
+          # reports active, so the check is retried rather than run once.
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "${url}/health" || true)
+            if [ "$code" = "200" ]; then
+              echo "GET ${url}/health -> 200"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::${url}/health never returned 200"
+          exit 1
+
+      - name: Summary
+        run: |
+          {
+            echo "### Deployed to EKS"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Image | \`${{ needs.image.outputs.image }}\` |"
+            echo "| Cluster | demo-eks (us-east-1) |"
+            echo "| Namespace | production |"
+            echo "| URL | ${{ steps.alb.outputs.url }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

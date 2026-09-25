@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# EKS target. Apply with:  kubectl apply -k k8s/overlays/aws
+resources:
+  - ../../base
+  - ingress-alb.yaml
+
+images:
+  - name: rdicidr
+    newName: 931686776282.dkr.ecr.us-east-1.amazonaws.com/rdicidr
+    # Rewritten by the deploy job to the commit SHA before applying. The ECR
+    # repository is tag-immutable, so every deploy is a distinct, traceable image
+    # and `latest` never enters the picture.
+    newTag: IMAGE_TAG_PLACEHOLDER

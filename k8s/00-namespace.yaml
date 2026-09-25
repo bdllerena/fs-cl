@@ -1,8 +1,0 @@
-# Files are numbered because `kubectl apply -f k8s/` processes them in
-# alphabetical order: the namespace has to exist before anything is placed in it.
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: production
-  labels:
-    app.kubernetes.io/part-of: rdicidr
