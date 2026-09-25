@@ -1,0 +1,160 @@
+name: CI
+
+# Runs on every pull request against any branch, and on pushes to main so the
+# post-merge state is verified too.
+# Defect fixed (findings P1-11): the previous `feature-*` push filter never matched
+# `feature/*` branches, because `*` does not cross `/` in GitHub branch globs.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches:
+      - main
+
+# Defect fixed (findings P1-12): no permissions block meant the default, overly broad
+# GITHUB_TOKEN scope. This workflow only reads the repository.
+permissions:
+  contents: read
+
+# Defect fixed (findings P1-12): without a concurrency group, every push to a PR
+# branch left the previous, now-obsolete run occupying a runner.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Defect fixed (findings P0-2): the application is not at the repository root.
+  # Single source of truth for the application directory, used by the cache paths
+  # below. Cache paths are workspace-relative and are NOT affected by
+  # defaults.run.working-directory.
+  APP_DIR: codebase/rdicidr-0.1.0
+
+defaults:
+  run:
+    # Defect fixed (findings P0-2): every npm step previously ran at the repository
+    # root, where no package.json exists.
+    working-directory: codebase/rdicidr-0.1.0
+
+jobs:
+  install:
+    name: Install dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      # Defect fixed (findings P0-33, found by run 36176886901): the cache key is
+      # computed once here, from the pristine checked-out lockfile, and reused by
+      # every downstream job. Previously each job called hashFiles() itself, and the
+      # save step evaluated it AFTER `npm install` had rewritten package-lock.json,
+      # so install saved under one key while lint/test/build restored another.
+      cache-key: ${{ steps.cache-key.outputs.key }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          # Defect fixed (findings P0-4): the workflow hardcoded Node 14 while
+          # package.json requires >=15 <16 and .npmrc sets engine-strict=true.
+          # .nvmrc is now the single source of truth.
+          node-version-file: codebase/rdicidr-0.1.0/.nvmrc
+
+      - name: Compute dependency cache key
+        id: cache-key
+        # Must run BEFORE `npm install`, while package-lock.json is still the
+        # committed version. Defect fixed (findings P1-8): the old pattern
+        # 'package-lock.json' resolved against GITHUB_WORKSPACE, matched nothing, and
+        # returned an empty string, collapsing every key to the constant
+        # "node-modules-" so the cache never invalidated on a dependency change.
+        run: echo "key=node-modules-${{ runner.os }}-${{ hashFiles('codebase/rdicidr-0.1.0/package-lock.json') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Cache node_modules
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.APP_DIR }}/node_modules
+          key: ${{ steps.cache-key.outputs.key }}
+
+  lint:
+    name: Lint (ESLint)
+    # Defect fixed: lint, test and build previously all depended only on `install`
+    # and ran in parallel. The required order is install -> lint -> test -> build.
+    # `install` stays in `needs` throughout so its cache-key output stays reachable.
+    needs: install
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: codebase/rdicidr-0.1.0/.nvmrc
+
+      - name: Restore node_modules
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.APP_DIR }}/node_modules
+          key: ${{ needs.install.outputs.cache-key }}
+          # Defect fixed (findings P1-9): a cache miss used to pass silently and the
+          # job then died several steps later with a misleading
+          # "command not found". Now it fails at the restore step.
+          fail-on-cache-miss: true
+
+      - name: Run ESLint
+        run: npm run lint
+
+  test:
+    name: Test (Jest)
+    needs: [install, lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: codebase/rdicidr-0.1.0/.nvmrc
+
+      - name: Restore node_modules
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.APP_DIR }}/node_modules
+          key: ${{ needs.install.outputs.cache-key }}
+          fail-on-cache-miss: true
+
+      - name: Run Jest
+        run: CI=true npm run test
+
+  build:
+    name: Build
+    needs: [install, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: codebase/rdicidr-0.1.0/.nvmrc
+
+      - name: Restore node_modules
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.APP_DIR }}/node_modules
+          # Defect fixed (findings P0-7): this job restored the key "deps-..." while
+          # the install job saved "node-modules-...", so the restore always missed,
+          # the build ran without node_modules, and it failed with
+          # "react-scripts: command not found".
+          key: ${{ needs.install.outputs.cache-key }}
+          fail-on-cache-miss: true
+
+      - name: Build production bundle
+        run: npm run build
